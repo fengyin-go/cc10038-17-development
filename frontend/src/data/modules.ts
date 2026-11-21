@@ -122,6 +122,8 @@ export const MODULES: ModuleMeta[] = [
     actions: ["执行归档", "暂停归档"],
     actionTargets: {"执行归档": "已执行", "暂停归档": "已暂停"},
     metrics: ["归档策略数", "已归档批次", "待归档批次"],
+    // 策略执行会产出可恢复的归档批次，页面在策略列表上方展示批次面板。
+    archivePanel: true,
   },
   {
     key: "rate_limiter",

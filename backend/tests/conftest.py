@@ -4,7 +4,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.store import store
+from app.store import INTERNAL_TABLES, store
 from app.seed import SEED_ROWS
 
 
@@ -14,6 +14,8 @@ def reset_store():
     store._tables = {
         name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
     }
+    for name in INTERNAL_TABLES:
+        store._tables[name] = []
     yield
 
 

@@ -8,15 +8,20 @@ from typing import Any
 
 from app.seed import SEED_ROWS
 
+# 归档批次账本和重放占用是内部支撑表，不作为业务模块出现在概览里。
+INTERNAL_TABLES = {"archive_batch", "replay_lease"}
+
 
 class Store:
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        for name in INTERNAL_TABLES:
+            self._tables[name] = []
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in INTERNAL_TABLES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

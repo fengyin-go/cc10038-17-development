@@ -71,6 +71,23 @@ npm run dev
 | 聚合查询视图 | `aggregation_view` | 聚合视图 | 视图名称、聚合维度、指标定义 |
 | 采集血缘 | `data_lineage` | 血缘关系 | 来源批次、解析规则版本、标准化版本 |
 
+## 归档批次与重放协作
+
+归档不再只改策略状态，而是产出“可恢复的归档批次”（`app/services/archive_service.py`）：
+
+- `POST /api/pipeline/archive/batch` 按归档条件迁移批次原始正文，保存正文摘要和
+  `archive://<归档批次号>/line/<原始行号>` 位置，并把结果（归档状态、进度、核验状态、
+  清单摘要）回写到归档策略行。
+- `GET /api/pipeline/archive/batch/{归档批次号}/manifest?fmt=md|csv|json` 返回可读清单，
+  清单里的行状态与正文来源实时对齐原始行。
+- 状态固定按 `待归档 → 归档中 → 已核验 → 已归档 → 已恢复` 前进；核验不通过只能回到
+  `归档中` 重试，不核验通过不允许释放热存。重试归档按“迁移确认”跳过已确认行。
+- `POST /api/pipeline/replay/start` 先登记重放并占用批次正文，此时归档回收热存会暂缓
+  （批次停在 `已核验`、进度可见），`/advance` 结束后自动续做释放；`/cancel` 解除占用。
+- `GET /api/pipeline/body/{批次编号}?line_no=` 按原批次号/原始行号返回每行正文当前来源
+  （热存 / 归档存储 / 不可用），重放就按这个来源解析。原始日志列表新增
+  `归档批次号、归档位置、归档状态、正文来源` 列。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

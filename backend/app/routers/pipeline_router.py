@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from app.services.pipeline import pipeline
@@ -56,6 +57,13 @@ class WatermarkPayload(BaseModel):
 class ReplayPayload(BaseModel):
     history_batch_range: str = Field(..., min_length=1)
     new_parser_rule: str = Field(..., min_length=1)
+
+
+class ArchiveBatchPayload(BaseModel):
+    batch_no: str = Field(..., min_length=1)
+    policy_id: int | None = None
+    conditions: dict[str, Any] = Field(default_factory=dict)
+    auto_release: bool = True
 
 
 class SchemaEvolvePayload(BaseModel):
@@ -127,6 +135,83 @@ def pipeline_advance_watermark(payload: WatermarkPayload) -> dict[str, Any]:
 @router.post("/replay/batch")
 def pipeline_replay_batch(payload: ReplayPayload) -> dict[str, Any]:
     return pipeline.replay_batch(payload.history_batch_range, payload.new_parser_rule)
+
+
+@router.post("/replay/start")
+def pipeline_start_replay(payload: ReplayPayload) -> dict[str, Any]:
+    """只登记并占用批次正文，便于观察归档与重放的正文使用冲突。"""
+    return pipeline.start_replay(payload.history_batch_range, payload.new_parser_rule)
+
+
+@router.post("/replay/{replay_id}/advance")
+def pipeline_advance_replay(replay_id: int) -> dict[str, Any]:
+    return pipeline.advance_replay(replay_id)
+
+
+@router.post("/replay/{replay_id}/cancel")
+def pipeline_cancel_replay(replay_id: int) -> dict[str, Any]:
+    return pipeline.cancel_replay(replay_id)
+
+
+@router.get("/replay/{replay_id}/status")
+def pipeline_replay_status(replay_id: int) -> dict[str, Any]:
+    return pipeline.replay_status(replay_id)
+
+
+@router.post("/archive/batch")
+def pipeline_archive_batch(payload: ArchiveBatchPayload) -> dict[str, Any]:
+    """按归档条件创建可恢复的归档批次并迁移完整正文。"""
+    return pipeline.archive_batch(
+        payload.batch_no,
+        policy_id=payload.policy_id,
+        conditions=payload.conditions,
+        auto_release=payload.auto_release,
+    )
+
+
+@router.get("/archive/batch/{archive_no}/manifest")
+def pipeline_archive_manifest(archive_no: str, fmt: str = Query(default="md")) -> Any:
+    ok, content = pipeline.pipeline_manifest(archive_no, fmt)
+    if not ok:
+        raise HTTPException(status_code=404, detail=content)
+    media = "application/json" if fmt.lower() == "json" else "text/plain"
+    return PlainTextResponse(content, media_type=f"{media}; charset=utf-8")
+
+
+@router.get("/archive/batches")
+def pipeline_list_archives(batch_no: str | None = Query(default=None),
+                           status: str | None = Query(default=None)) -> dict[str, Any]:
+    from app.services.archive_service import archive_ledger
+
+    items = archive_ledger.list_batches(status=status, batch_no=batch_no)
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+@router.post("/archive/batch/{archive_no}/verify")
+def pipeline_verify_archive(archive_no: str) -> dict[str, Any]:
+    return pipeline.verify_archive(archive_no)
+
+
+@router.post("/archive/batch/{archive_no}/restore")
+def pipeline_restore_archive(archive_no: str) -> dict[str, Any]:
+    return pipeline.restore_archive(archive_no)
+
+
+@router.get("/archive/progress/{batch_no}")
+def pipeline_archive_progress(batch_no: str) -> dict[str, Any]:
+    return pipeline.archive_progress(batch_no)
+
+
+@router.post("/archive/batch/{archive_no}/release")
+def pipeline_release_archive(archive_no: str) -> dict[str, Any]:
+    """释放热存；未通过核验或正被重放占用时拒绝/暂缓。"""
+    return pipeline.release_archive(archive_no)
+
+
+@router.get("/body/{batch_no}")
+def pipeline_replay_bodies(batch_no: str, line_no: str | None = Query(default=None)) -> dict[str, Any]:
+    """按原始批次号和原始行号查看正文当前从哪里可用。"""
+    return pipeline.replay_bodies(batch_no, line_no)
 
 
 @router.post("/schema/evolve")

@@ -10,6 +10,12 @@ import json
 import time
 from typing import Any
 
+from app.services.archive_service import (
+    SOURCE_ARCHIVE,
+    SOURCE_HOT,
+    SOURCE_MISSING,
+    archive_ledger,
+)
 from app.store import store
 
 
@@ -573,51 +579,395 @@ class IngestPipeline:
         return {"ok": True, "message": f"数据源 {source_id} 水位已推进到 {watermark_value}"}
 
     # ---------- 回溯重放 ----------
-    def replay_batch(
+    def _replay_batch_numbers(self, history_batch_range: str) -> list[str]:
+        """按原批次号定位重放目标：支持单批次或逗号分隔的批次号。"""
+        parts = [part.strip() for part in str(history_batch_range).split(",") if part.strip()]
+        if not parts:
+            return []
+        existing = {str(b.get("批次编号")) for b in store.rows("ingest_batch")}
+        known: set[str] = set()
+        for part in parts:
+            archived = archive_ledger.batch_for_source(part)
+            if archived is not None:
+                known.add(str(archived.get("源批次号")))
+        resolved: list[str] = []
+        for part in parts:
+            if part in existing or part in known:
+                resolved.append(part)
+                continue
+            matches = [
+                str(b.get("批次编号")) for b in store.rows("ingest_batch")
+                if part in str(b.get("批次编号"))
+            ]
+            resolved.extend(matches or [part])
+        return resolved
+
+    def start_replay(
         self,
         history_batch_range: str,
         new_parser_rule: str,
     ) -> dict[str, Any]:
-        """用新解析规则版本回溯重放历史批次。"""
+        """登记重放任务并占用批次正文：占用期间归档会暂缓释放热存。"""
         replayers = store.rows("replay_engine")
-
+        batch_numbers = self._replay_batch_numbers(history_batch_range)
         replay_id = _next_id("replay_engine")
         replay_entry = {
             "id": replay_id,
             "历史批次范围": history_batch_range,
             "新解析规则版本": new_parser_rule,
-            "重放状态": "已创建",
+            "重放状态": "重放中",
             "产出记录数": "0",
             "执行时间": _now_iso(),
             "status": "重放中",
             "pending": True,
             "abnormal": False,
+            "正文来源统计": {},
+            "归档进度": {},
+            "重放行数": 0,
+            "缺失正文行数": 0,
+            "批次编号列表": batch_numbers,
+            "重放进度": "占用正文中",
         }
         replayers.append(replay_entry)
 
-        # 对历史批次的原始日志重新解析
-        parsed = store.rows("parsed_entity")
-        replay_count = 0
-        for entity in parsed:
-            if entity.get("status") == "校验通过":
-                entity["status"] = "待校验"
-                entity["pending"] = True
-                entity["解析规则版本"] = new_parser_rule
-                entity["replay_id"] = str(replay_id)
-                entity["replayed_at"] = _now_iso()
-                replay_count += 1
-
-        replay_entry["产出记录数"] = str(replay_count)
-        replay_entry["status"] = "已完成"
-        replay_entry["pending"] = False
-        replay_entry["重放状态"] = "已完成"
-
+        progress_snapshots: dict[str, Any] = {}
+        for batch_no in batch_numbers:
+            archive_ledger.begin_replay_lease(batch_no, replay_id)
+            progress_snapshots[batch_no] = archive_ledger.progress(batch_no)
+        replay_entry["归档进度"] = progress_snapshots
         return {
             "ok": True,
-            "message": f"历史批次 {history_batch_range} 用规则 {new_parser_rule} 重放完成",
+            "message": f"重放 {replay_id} 已开始，正在占用批次正文",
             "replay": replay_entry,
-            "replayed_count": replay_count,
+            "归档进度": progress_snapshots,
         }
+
+    def advance_replay(self, replay_id: int | str) -> dict[str, Any]:
+        """执行已登记的重放任务：按原批次号逐行解析正文并释放占用。"""
+        replayers = store.rows("replay_engine")
+        replay_entry = None
+        for entry in replayers:
+            if str(entry.get("id")) == str(replay_id):
+                replay_entry = entry
+                break
+        if replay_entry is None:
+            return {"ok": False, "message": f"重放任务 {replay_id} 不存在"}
+        if replay_entry.get("status") != "重放中":
+            return {
+                "ok": replay_entry.get("status") == "已完成",
+                "message": f"重放任务 {replay_id} 当前状态为 {replay_entry.get('status')}，不能继续执行",
+                "replay": replay_entry,
+            }
+
+        new_parser_rule = str(replay_entry.get("新解析规则版本"))
+        batch_numbers = replay_entry.get("批次编号列表") or self._replay_batch_numbers(
+            str(replay_entry.get("历史批次范围"))
+        )
+
+        parsers = store.rows("field_parser")
+        rule = None
+        for p in parsers:
+            if p.get("规则名称") == new_parser_rule:
+                rule = p
+                break
+        if rule is None:
+            for p in parsers:
+                if p.get("status") == "已发布":
+                    rule = p
+                    break
+        if rule is None:
+            for batch_no in batch_numbers:
+                archive_ledger.end_replay_lease(batch_no, replay_id)
+            replay_entry["status"] = "部分失败"
+            replay_entry["重放状态"] = "部分失败"
+            replay_entry["pending"] = False
+            replay_entry["abnormal"] = True
+            replay_entry["重放进度"] = "无可用解析规则"
+            return {
+                "ok": False,
+                "message": "无可用解析规则，重放未读取任何正文",
+                "replay": replay_entry,
+                "replayed_count": 0,
+            }
+
+        parsed = store.rows("parsed_entity")
+        journal = store.rows("parse_journal")
+        total_replayed = 0
+        total_missing = 0
+        source_totals: dict[str, int] = {}
+        progress_snapshots: dict[str, Any] = {}
+        per_batch: dict[str, Any] = {}
+
+        for batch_no in batch_numbers:
+            availability = archive_ledger.availability(batch_no)
+            if not availability["行数"]:
+                per_batch[batch_no] = {"ok": False, "reason": "批次没有原始日志", "replayed": 0,
+                                       "missing": 0, "正文来源": {}}
+                total_missing += 1
+                archive_ledger.end_replay_lease(batch_no, replay_id)
+                progress_snapshots[batch_no] = archive_ledger.progress(batch_no)
+                continue
+
+            batch_replayed = 0
+            batch_missing = 0
+            try:
+                for row in availability["行明细"]:
+                    if row["正文来源"] == SOURCE_MISSING or not row.get("正文"):
+                        batch_missing += 1
+                        continue
+                    source_totals[row["正文来源"]] = source_totals.get(row["正文来源"], 0) + 1
+                    raw_id = str(row["原始记录ID"])
+                    try:
+                        fields = self._parse_body(str(row["正文"]), rule)
+                    except Exception:
+                        batch_missing += 1
+                        continue
+
+                    entity = None
+                    for candidate in parsed:
+                        if (candidate.get("来源批次") == batch_no
+                                and str(candidate.get("原始记录ID")) == raw_id):
+                            entity = candidate
+                            break
+                    if entity is None:
+                        entity = {
+                            "id": _next_id("parsed_entity"),
+                            "来源批次": batch_no,
+                            "原始记录ID": raw_id,
+                            "解析规则版本": new_parser_rule,
+                            "标准化字段集": "{}",
+                            "校验状态": "",
+                            "status": "待校验",
+                            "pending": True,
+                            "abnormal": False,
+                            "schema_version": "v1.0",
+                        }
+                        parsed.append(entity)
+                    entity["标准化字段集"] = json.dumps(fields, ensure_ascii=False)
+                    entity["解析规则版本"] = new_parser_rule
+                    entity["校验状态"] = ""
+                    entity["status"] = "待校验"
+                    entity["pending"] = True
+                    entity["abnormal"] = False
+                    entity["replay_id"] = str(replay_id)
+                    entity["replayed_at"] = _now_iso()
+                    entity["source_of_body"] = row["正文来源"]
+                    entity["content_digest"] = _stable_digest(fields)
+                    batch_replayed += 1
+            finally:
+                # 无论解析是否中断都释放占用，避免归档一直无法回收热存。
+                completed = archive_ledger.end_replay_lease(batch_no, replay_id)
+                if completed:
+                    per_batch.setdefault(batch_no, {})["归档续做"] = completed
+
+            per_batch[batch_no] = {
+                "ok": batch_missing == 0,
+                "replayed": batch_replayed,
+                "missing": batch_missing,
+                "正文来源": availability["正文来源"],
+                **per_batch.get(batch_no, {}),
+            }
+            total_replayed += batch_replayed
+            total_missing += batch_missing
+            journal.append({
+                "id": _next_id("parse_journal"),
+                "操作类型": "回溯重放",
+                "批次编号": batch_no,
+                "执行时间": _now_iso(),
+                "影响的记录数": str(batch_replayed),
+                "执行结果": "成功" if batch_missing == 0 else "部分成功",
+                "status": "成功" if batch_missing == 0 else "部分成功",
+                "pending": batch_missing > 0,
+                "abnormal": batch_missing > 0,
+                "replay_id": str(replay_id),
+                "正文来源": availability["正文来源"],
+            })
+            progress_snapshots[batch_no] = archive_ledger.progress(batch_no)
+
+        replay_entry["产出记录数"] = str(total_replayed)
+        replay_entry["重放行数"] = total_replayed
+        replay_entry["缺失正文行数"] = total_missing
+        replay_entry["正文来源统计"] = source_totals
+        replay_entry["归档进度"] = progress_snapshots
+        replay_entry["批次明细"] = per_batch
+        replay_entry["status"] = "已完成" if total_missing == 0 and total_replayed else "部分失败"
+        replay_entry["pending"] = replay_entry["status"] != "已完成"
+        replay_entry["abnormal"] = replay_entry["status"] != "已完成"
+        replay_entry["重放状态"] = replay_entry["status"]
+        replay_entry["重放进度"] = "已完成"
+
+        return {
+            "ok": replay_entry["status"] == "已完成",
+            "message": (
+                f"历史批次 {replay_entry.get('历史批次范围')} 用规则 {new_parser_rule} 重放完成"
+                if replay_entry["status"] == "已完成"
+                else f"历史批次 {replay_entry.get('历史批次范围')} 重放部分失败：正文缺失 {total_missing} 行"
+            ),
+            "replay": replay_entry,
+            "replayed_count": total_replayed,
+            "missing_count": total_missing,
+            "正文来源统计": source_totals,
+            "归档进度": progress_snapshots,
+            "per_batch": per_batch,
+        }
+
+    def cancel_replay(self, replay_id: int | str) -> dict[str, Any]:
+        """取消重放：释放占用，被暂缓的归档释放会继续完成。"""
+        replay_entry = None
+        for entry in store.rows("replay_engine"):
+            if str(entry.get("id")) == str(replay_id):
+                replay_entry = entry
+                break
+        if replay_entry is None:
+            return {"ok": False, "message": f"重放任务 {replay_id} 不存在"}
+        if replay_entry.get("status") not in ("重放中", "待重放"):
+            return {
+                "ok": False,
+                "message": f"重放任务 {replay_id} 当前状态为 {replay_entry.get('status')}，无需取消",
+                "replay": replay_entry,
+            }
+
+        batch_numbers = replay_entry.get("批次编号列表") or self._replay_batch_numbers(
+            str(replay_entry.get("历史批次范围"))
+        )
+        progress_snapshots: dict[str, Any] = {}
+        resumed: list[str] = []
+        for batch_no in batch_numbers:
+            resumed.extend(archive_ledger.end_replay_lease(batch_no, replay_id))
+            progress_snapshots[batch_no] = archive_ledger.progress(batch_no)
+        replay_entry["status"] = "部分失败"
+        replay_entry["重放状态"] = "已取消"
+        replay_entry["pending"] = False
+        replay_entry["abnormal"] = True
+        replay_entry["重放进度"] = "已取消"
+        replay_entry["归档进度"] = progress_snapshots
+        return {
+            "ok": True,
+            "message": f"重放任务 {replay_id} 已取消，归档释放占用已解除",
+            "replay": replay_entry,
+            "归档进度": progress_snapshots,
+            "归档续做": resumed,
+        }
+
+    def replay_status(self, replay_id: int | str) -> dict[str, Any]:
+        for entry in store.rows("replay_engine"):
+            if str(entry.get("id")) == str(replay_id):
+                batch_numbers = entry.get("批次编号列表") or self._replay_batch_numbers(
+                    str(entry.get("历史批次范围"))
+                )
+                progress = {
+                    batch_no: archive_ledger.progress(batch_no) for batch_no in batch_numbers
+                }
+                return {
+                    "ok": True,
+                    "replay": entry,
+                    "归档进度": progress,
+                    "重放占用": {
+                        batch_no: archive_ledger.active_lease(batch_no) is not None
+                        for batch_no in batch_numbers
+                    },
+                }
+        return {"ok": False, "message": f"重放任务 {replay_id} 不存在", "replay": None}
+
+    def replay_batch(
+        self,
+        history_batch_range: str,
+        new_parser_rule: str,
+    ) -> dict[str, Any]:
+        """一次完成登记与执行，便于整体重放和自动化验证。"""
+        started = self.start_replay(history_batch_range, new_parser_rule)
+        result = self.advance_replay(started["replay"]["id"])
+        return result
+
+    # ---------- 归档批次编排 ----------
+    def archive_batch(
+        self,
+        batch_no: str,
+        *,
+        policy_id: int | None = None,
+        conditions: dict[str, Any] | None = None,
+        auto_release: bool = True,
+    ) -> dict[str, Any]:
+        """按归档条件把批次原始正文迁移为可恢复的归档批次。"""
+        policy = store.find("data_archive", policy_id) if policy_id is not None else None
+        result = archive_ledger.create_batch(
+            batch_no,
+            policy_id=policy_id,
+            policy=policy,
+            conditions=conditions,
+            auto_release=auto_release,
+        )
+        entry = result.get("batch")
+        if entry is not None and policy is not None:
+            policy["status"] = "已执行"
+            policy["pending"] = False
+            self._sync_policy(entry)
+        return result
+
+    def archive_by_policy(self, policy_id: int, batch_no: str) -> dict[str, Any]:
+        """归档策略执行入口：策略条件可用于筛选批次原始行。"""
+        policy = store.find("data_archive", policy_id)
+        if policy is None:
+            return {"ok": False, "message": f"归档策略 {policy_id} 不存在", "batch": None}
+        conditions = policy.get("归档条件") or {}
+        if isinstance(conditions, str):
+            try:
+                conditions = json.loads(conditions)
+            except json.JSONDecodeError:
+                conditions = {}
+        return self.archive_batch(batch_no, policy_id=policy_id, conditions=conditions)
+
+    def archive_progress(self, batch_no: str) -> dict[str, Any]:
+        return archive_ledger.progress(batch_no)
+
+    def verify_archive(self, archive_no: str) -> dict[str, Any]:
+        result = archive_ledger.verify(archive_no)
+        entry = result.get("batch")
+        if entry is not None:
+            self._sync_policy(entry)
+        return result
+
+    def release_archive(self, archive_no: str) -> dict[str, Any]:
+        result = archive_ledger.release(archive_no)
+        entry = result.get("batch")
+        if entry is not None:
+            self._sync_policy(entry)
+        return result
+
+    def restore_archive(self, archive_no: str) -> dict[str, Any]:
+        result = archive_ledger.restore(archive_no)
+        entry = result.get("batch")
+        if entry is not None:
+            self._sync_policy(entry)
+        return result
+
+    def pipeline_manifest(self, archive_no: str, fmt: str = "md") -> tuple[bool, str]:
+        return archive_ledger.manifest(archive_no, fmt)
+
+    def _sync_policy(self, entry: dict[str, Any]) -> None:
+        """把归档批次结果回写归档策略，策略清单直接可读。"""
+        policy_id = entry.get("策略ID")
+        if policy_id is None:
+            return
+        policy = store.find("data_archive", int(policy_id))
+        if policy is None:
+            return
+        policy["归档状态"] = entry.get("status")
+        policy["归档批次号"] = entry.get("归档批次号")
+        policy["已归档行数"] = entry.get("已归档行数", 0)
+        policy["已恢复行数"] = entry.get("已恢复行数", 0)
+        policy["归档进度"] = entry.get("归档进度", 0)
+        policy["核验状态"] = entry.get("核验状态")
+        policy["清单摘要"] = (entry.get("manifest_text") or "").splitlines()[0]
+        policy["最近执行时间"] = _now_iso()
+        policy["abnormal"] = entry.get("abnormal", False)
+
+    def replay_bodies(self, batch_no: str, line_no: str | None = None) -> dict[str, Any]:
+        """按原批次号展示每行正文当前从哪里可用。"""
+        result = archive_ledger.resolve_body(batch_no, line_no)
+        result["归档进度"] = archive_ledger.progress(batch_no)
+        return result
+
 
     # ---------- Schema 版本演进 ----------
     def evolve_schema(
